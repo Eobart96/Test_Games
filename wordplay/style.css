@@ -147,6 +147,13 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
   border: 2px solid rgba(20,52,59,0.08);
 }
 .level-btn.selected { background: var(--ink); color: white; border-color: var(--ink); }
+.level-btn.small { padding: 8px 14px; font-size: 14px; }
+.settings-row { display: flex; flex-wrap: wrap; gap: 14px; position: relative; margin-bottom: 6px; }
+.setting-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.setting-label { font-weight: 700; font-size: 14px; color: var(--ink-soft); }
+.hearts { display: inline-flex; gap: 2px; font-size: 15px; }
+.heart.lost { opacity: .35; filter: grayscale(1); }
+.need-practice { margin-top: 14px; padding: 10px 14px; background: #fff3e6; border: 2px dashed #ffb066; border-radius: 14px; font-weight: 700; font-size: 14px; text-align: center; }
 
 .cta-row { display: flex; gap: 14px; margin-top: 34px; flex-wrap: wrap; position: relative; }
 .btn-primary {

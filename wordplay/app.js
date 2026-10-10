@@ -28,6 +28,9 @@ const defaultState = {
   gamesPlayed: 0,
   customDeck: [], // {id, sk, ru, emoji}
   sound: true,
+  roundLength: 8,   // 8 | 12 | 0 = нескінченно
+  tilesCount: 6,    // кількість плиток-варіантів 4..6
+  srs: {},          // { [normalize(sk)]: { box: 0..4, due: timestamp } }
 };
 let state = loadState();
 
@@ -101,12 +104,16 @@ const game = {
   category: "all",
   level: 0,          // 0 = все уровни
   useCustom: false,
+  pool: [],
   queue: [],         // слова раунда
   index: 0,
   score: 0,
   streak: 0,
   correctCount: 0,
   totalRounds: 8,
+  endless: false,
+  hearts: 5,
+  wrongWords: [],
   locked: false,
   builtLetters: [],  // для режима build
 };
@@ -135,6 +142,48 @@ function uniqueByDisplay(pool) {
     seen.add(k);
     return true;
   });
+}
+
+// ---------- SRS: интервальное повторение (лёгкие ящики) ----------
+const SRS_INTERVALS_MIN = [0, 10, 60, 24 * 60, 7 * 24 * 60]; // box 0..4 → задержка до повтора
+function srsGet(wordObj) {
+  return state.srs[normalize(wordObj.display)] || { box: 0, due: 0 };
+}
+function srsRecord(wordObj, correct) {
+  const key = normalize(wordObj.display);
+  const cur = state.srs[key] || { box: 0, due: 0 };
+  let next;
+  if (correct) {
+    const box = Math.min(cur.box + 1, SRS_INTERVALS_MIN.length - 1);
+    next = { box, due: Date.now() + SRS_INTERVALS_MIN[box] * 60_000 };
+  } else {
+    next = { box: 0, due: Date.now() }; // ошибка → сразу в очередь
+  }
+  state.srs[key] = next;
+  saveState();
+}
+// взвешенная выборка: просроченные/новые слова идут чаще выученных
+function weightedSample(pool, n) {
+  const now = Date.now();
+  const weight = (w) => {
+    const s = srsGet(w);
+    if (!s.due) return 3;                       // ещё не встречалось
+    if (s.due <= now) return 5 / (s.box + 1);   // пора повторить — тем выше, чем слабее
+    return 0.4;                                  // не время — низкий шанс
+  };
+  const items = [...pool];
+  const picked = [];
+  while (picked.length < Math.min(n, items.length)) {
+    const total = items.reduce((a, w) => a + weight(w), 0);
+    let r = Math.random() * total;
+    let idx = 0;
+    for (; idx < items.length; idx++) {
+      r -= weight(items[idx]);
+      if (r <= 0) break;
+    }
+    picked.push(items.splice(Math.min(idx, items.length - 1), 1)[0]);
+  }
+  return picked;
 }
 
 // ---------- Рендер: каркас ----------
@@ -213,6 +262,22 @@ function renderHome() {
             <button class="level-btn ${game.level === l.lv ? "selected" : ""}" data-action="pick-level" data-level="${l.lv}">${l.label}</button>`).join("")}
         </div>
 
+        <div class="section-label">4 · Nastavenia / Настройки</div>
+        <div class="settings-row">
+          <div class="setting-group">
+            <span class="setting-label">Kolo / Раунд:</span>
+            ${[8, 12, 0].map(n => `
+              <button class="level-btn small ${state.roundLength === n ? "selected" : ""}" data-action="pick-length" data-len="${n}">
+                ${n === 0 ? "∞ Nekonečno" : n + " slov"}
+              </button>`).join("")}
+          </div>
+          <div class="setting-group">
+            <span class="setting-label">Dlaždice / Плитки:</span>
+            ${[4, 5, 6].map(n => `
+              <button class="level-btn small ${state.tilesCount === n ? "selected" : ""}" data-action="pick-tiles" data-tiles="${n}">${n}</button>`).join("")}
+          </div>
+        </div>
+
         <div class="cta-row">
           <button class="btn-primary" data-action="start-game">▶ Hrať! Играть</button>
           ${customCount > 0 ? `<button class="btn-secondary" data-action="toggle-custom">
@@ -225,37 +290,54 @@ function renderHome() {
 }
 
 // ---------- Старт игры ----------
+const MAX_HEARTS = 5;
 function startGame() {
   const pool = uniqueByDisplay(getPool());
   if (pool.length < 4) {
     showToast("❌ Málo slov v tejto téme! Выбери другую тему или добавь свои слова.", "bad");
     return;
   }
-  game.totalRounds = Math.min(8, pool.length);
-  game.queue = sample(pool, game.totalRounds);
+  game.pool = pool;
+  game.endless = state.roundLength === 0;
+  game.totalRounds = game.endless ? Infinity : Math.min(state.roundLength, pool.length);
+  game.queue = weightedSample(pool, game.totalRounds);
   game.index = 0;
   game.score = 0;
   game.streak = 0;
   game.correctCount = 0;
+  game.wrongWords = []; // SRS: эти слова надо подтянуть
+  game.hearts = MAX_HEARTS;
   game.locked = false;
   state.gamesPlayed++;
   saveState();
   renderGame();
 }
 
+// в бесконечном режиме дозаполняем очередь по SRS-весам
+function ensureQueue() {
+  while (game.queue.length <= game.index + 1 && game.pool.length > 0) {
+    const extra = weightedSample(game.pool, 1)[0];
+    if (!extra) break;
+    game.queue.push(extra);
+  }
+}
+
 // ---------- Экран: Игра ----------
 function renderGame() {
+  ensureQueue(); // на случай, если очередь закончилась (endless)
   const word = game.queue[game.index];
   const pool = uniqueByDisplay(getPool()).filter(w => normalize(w.display) !== normalize(word.display));
 
-  const progressPct = Math.round((game.index / game.totalRounds) * 100);
+  const progressPct = game.endless
+    ? Math.min(100, Math.round((game.index / 20) * 100))
+    : Math.round((game.index / game.totalRounds) * 100);
 
   let stageHTML = "";
 
   if (game.mode === "build") {
     stageHTML = buildStage(word);
   } else {
-    const tilesCount = Math.min(6, Math.max(4, pool.length));
+    const tilesCount = Math.min(state.tilesCount, pool.length);
     const options = sample(pool, tilesCount - 1);
     const tiles = shuffle([word, ...options]);
 
@@ -284,7 +366,8 @@ function renderGame() {
     ${renderTopbar()}
     <main class="game-wrap">
       <div class="round-info">
-        <span>Kolo ${game.index + 1} / ${game.totalRounds}</span>
+        <span>${game.endless ? `Kolo ${game.index + 1} · ∞` : `Kolo ${game.index + 1} / ${game.totalRounds}`}</span>
+        <span class="hearts">${Array.from({ length: MAX_HEARTS }, (_, i) => `<span class="heart ${i < game.hearts ? "" : "lost"}">${i < game.hearts ? "❤️" : "🖤"}</span>`).join("")}</span>
         <span>🏆 ${game.score} b · 🔥 ${game.streak}</span>
         <button class="mini-btn" data-action="quit-game">✕ Koniec</button>
       </div>
@@ -375,6 +458,9 @@ function handleTypeLetter(letter) {
     const tile = $(".keypad");
     if (tile) { tile.style.animation = "shake 0.4s ease"; setTimeout(() => tile.style.animation = "", 450); }
     beep("wrong");
+    loseHeart();
+    srsRecord(word, false);
+    game.wrongWords.push(word);
     game.streak = 0;
     showToast(`❌ Nie je to «${letter}». Не та буква!`, "bad");
     renderGame();
@@ -402,6 +488,9 @@ function handlePickTile(el) {
     finishRound(true, word);
   } else {
     el.classList.add("wrong");
+    loseHeart();
+    srsRecord(word, false);
+    game.wrongWords.push(word);
     beep("wrong");
     game.streak = 0;
     showToast(`❌ Správne je: «${word.display}»`, "bad");
@@ -416,6 +505,10 @@ function handlePickTile(el) {
   }
 }
 
+function loseHeart() {
+  game.hearts = Math.max(0, game.hearts - 1);
+}
+
 function finishRound(correct, word) {
   if (correct) {
     game.correctCount++;
@@ -424,6 +517,7 @@ function finishRound(correct, word) {
     game.score += 10 + bonus;
     state.xp += 10 + bonus;
     state.bestStreak = Math.max(state.bestStreak, game.streak);
+    srsRecord(word, true);
     saveState();
     beep("correct");
     celebrate(false);
@@ -446,20 +540,38 @@ function nextRound() {
   game.buildNeeded = null;
   game.buildTarget = null;
   game.index++;
-  if (game.index >= game.totalRounds) {
-    renderResults();
+
+  const noHearts = game.hearts <= 0;
+  const finished = game.index >= game.totalRounds || noHearts;
+
+  if (finished) {
+    renderResults(noHearts);
   } else {
+    ensureQueue(); // в бесконечном режиме — новые слова по SRS-весам
     renderGame();
   }
 }
 
 // ---------- Экран: Результаты ----------
-function renderResults() {
-  const pct = Math.round((game.correctCount / game.totalRounds) * 100);
-  const medal = pct === 100 ? "🏆" : pct >= 75 ? "🥇" : pct >= 50 ? "🥈" : "🎖️";
-  const title = pct === 100 ? "Perfektné! Идеально!" : pct >= 75 ? "Výborná práca! Отличная работа!" : pct >= 50 ? "Dobré! Неплохо!" : "Skús znova! Попробуй ещё!";
+function renderResults(outOfHearts = false) {
+  const answered = Math.min(game.index, game.queue.length);
+  const pct = answered > 0 ? Math.round((game.correctCount / answered) * 100) : 0;
+  const medal = outOfHearts ? "💔" : pct === 100 ? "🏆" : pct >= 75 ? "🥇" : pct >= 50 ? "🥈" : "🎖️";
+  const title = outOfHearts
+    ? "Srdcia minuté! Сердечки закончились!"
+    : pct === 100 ? "Perfektné! Идеально!"
+    : pct >= 75 ? "Výborná práca! Отличная работа!"
+    : pct >= 50 ? "Dobré! Неплохо!"
+    : "Skús znova! Попробуй ещё!";
 
-  const learnedWords = game.queue.slice(0, game.totalRounds).map(w => `${w.emoji} ${w.display}`);
+  const uniq = uniqueByDisplay(game.queue.slice(0, game.index));
+  const learnedWords = uniq.map(w => `${w.emoji} ${w.display}`);
+
+  // SRS: слова с ошибками для повторения
+  const wrongList = uniqueByDisplay(game.wrongWords);
+  const practiceBtn = wrongList.length > 0
+    ? `<button class="btn-primary" data-action="practice-wrong">📌 Cvičiť slová na opakovanie · Повторить (${wrongList.length})</button>`
+    : "";
 
   app.innerHTML = `
     ${renderTopbar()}
@@ -468,12 +580,14 @@ function renderResults() {
         <div class="result-medal">${medal}</div>
         <h2 class="result-title">${title}</h2>
         <div class="result-stats">
-          <div class="stat-box"><div class="stat-num">${game.correctCount}/${game.totalRounds}</div><div class="stat-label">Správne / верно</div></div>
+          <div class="stat-box"><div class="stat-num">${game.correctCount}/${answered}</div><div class="stat-label">Správne / верно</div></div>
           <div class="stat-box"><div class="stat-num">${game.score}</div><div class="stat-label">Body / очки</div></div>
           <div class="stat-box"><div class="stat-num">+${game.score}</div><div class="stat-label">XP celkom ${state.xp}</div></div>
         </div>
-        <div class="learned-list">${learnedWords.map(w => `<span class="learned-item">${w}</span>`).join("")}</div>
+        ${learnedWords.length ? `<div class="learned-list">${learnedWords.map(w => `<span class="learned-item">${w}</span>`).join("")}</div>` : ""}
+        ${wrongList.length ? `<div class="need-practice">Na zlepšenie / Подтянуть: ${wrongList.map(w => w.emoji + " " + w.display).join(", ")}</div>` : ""}
         <div class="cta-row" style="justify-content:center">
+          ${practiceBtn}
           <button class="btn-primary" data-action="again">🔁 Hrať znova / Ещё раз</button>
           <button class="btn-secondary" data-action="home">🏠 Domov / Меню</button>
         </div>
@@ -481,7 +595,25 @@ function renderResults() {
     </main>`;
 
   beep("finish");
-  if (pct >= 75) celebrate(true);
+  if (!outOfHearts && pct >= 75) celebrate(true);
+}
+
+// SRS-режим: играем только словами, в которых были ошибки
+function startPracticeWrong() {
+  const pool = uniqueByDisplay(game.wrongWords);
+  if (pool.length < 2) { showToast("Málo slov na opakovačku.", "bad"); return; }
+  game.pool = pool;
+  game.endless = false;
+  game.totalRounds = Math.min(state.roundLength || 8, Math.max(pool.length, 4));
+  game.queue = shuffle(pool.concat(weightedSample(pool, game.totalRounds))).slice(0, game.totalRounds);
+  game.index = 0;
+  game.score = 0;
+  game.streak = 0;
+  game.correctCount = 0;
+  game.wrongWords = [];
+  game.hearts = MAX_HEARTS;
+  game.locked = false;
+  renderGame();
 }
 
 // ---------- Модалка: своя колода ----------
@@ -518,8 +650,12 @@ function renderDeckModal() {
 function addWord() {
   const sk = $("#inp-sk").value.trim();
   const ru = $("#inp-ru").value.trim();
-  const emoji = $("#inp-emoji").value.trim() || "🔤";
+  const emojiRaw = $("#inp-emoji").value; let emoji = emojiRaw.trim(); if (!emoji) { emoji = "🔤"; } else { try { emoji = [...new Intl.Segmenter(undefined, {granularity:"grapheme"}).segment(emoji)][0].segment; } catch(e) { emoji = Array.from(emoji)[0]; } }
   if (!sk) { showToast("⚠️ Zadaj slovenské slovo! Нужно слово!", "bad"); return; }
+  if (state.customDeck.some(d => normalize(d.sk) === normalize(sk))) {
+    showToast("⚠️ Také slovo už je v karte! Такое слово уже есть.", "bad");
+    return;
+  }
   state.customDeck.push({ id: Date.now(), sk, ru, emoji });
   saveState();
   beep("correct");
@@ -566,6 +702,8 @@ document.addEventListener("click", (e) => {
     case "pick-mode": game.mode = el.dataset.mode; renderHome(); break;
     case "pick-cat": game.category = el.dataset.cat; renderHome(); break;
     case "pick-level": game.level = Number(el.dataset.level); renderHome(); break;
+    case "pick-length": state.roundLength = Number(el.dataset.len); saveState(); renderHome(); break;
+    case "pick-tiles": state.tilesCount = Number(el.dataset.tiles); saveState(); renderHome(); break;
     case "toggle-custom": game.useCustom = !game.useCustom; renderHome(); break;
     case "start-game": startGame(); break;
     case "quit-game": renderHome(); break;
@@ -579,6 +717,7 @@ document.addEventListener("click", (e) => {
     case "add-word": addWord(); break;
     case "del-word": delWord(Number(el.dataset.id)); break;
     case "again": startGame(); break;
+    case "practice-wrong": startPracticeWrong(); break;
   }
 });
 
